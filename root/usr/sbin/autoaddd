@@ -11,7 +11,7 @@ let uci = require("uci");
 let socket = null;
 try { socket = require("socket"); } catch (e) {}
 
-const VERSION = "3.1.0";
+const VERSION = "3.1.1";
 // the daemon takes no arguments. A copy started by hand next to the service flushes the same
 // nft sets and wipes its probe directory, so anything like "autoaddd -v" only prints the version
 if (length(ARGV)) {
@@ -70,6 +70,8 @@ const IDLE_WATCH_SEC = 24 * 3600;
 const IDLE_BATCH = 10;
 // without a single DNS answer for this long nobody is home or the daemon hears nothing
 const DNS_DEAF_SEC = 24 * 3600;
+// the raw socket heard no DNS answer for this long: take them from dnsmasq on ubus instead
+const SNIFF_QUIET_SEC = 120;
 // hosts of the CDN itself. A device asks for the site and gets such a name only as the
 // target of a CNAME, where a domain rule never matches: sing-box compares the name asked for
 const CDN_INFRA = [ "akamai.net", "akamaiedge.net", "edgekey.net", "edgesuite.net", "akadns.net",
@@ -125,6 +127,7 @@ let sniff = null;
 let sniff_handle = null;
 let sniff_next = 0;
 let sniff_said = false;
+let sniff_heard = 0;
 let conn = null;
 let upd = { latest: null, checked: 0, state: "idle", error: null, next: started + UPDATE_FIRST_SEC };
 
@@ -1235,7 +1238,17 @@ function check_table() {
 	}
 }
 
+// dnsmasq holds each answer until its ubus subscribers have taken the event, and ucode-mod-ubus
+// runs a full garbage collection after every callback: with this daemon's heap that is ~20 ms
+// per A record. The raw socket hears the same answers off that path, so the subscription is
+// only a fallback for when the socket is missing or has gone quiet
 function dns_subscribe() {
+	if (sniff && time() - sniff_heard <= SNIFF_QUIET_SEC) {
+		if (dns_ok)
+			dns_sub.unsubscribe("dnsmasq.dns");
+		dns_ok = false;
+		return;
+	}
 	if (dns_ok)
 		return;
 	// dnsmasq publishes every answered A record on ubus; nothing is written to syslog
@@ -1339,11 +1352,13 @@ function sniff_start() {
 		return;
 	}
 	sniff = s;
+	sniff_heard = time();
 	sniff_handle = uloop.handle(s, function() {
 		for (let i = 0; i < 64; i++) {
 			let pkt = sniff.recv(4096);
 			if (!pkt)
 				break;
+			sniff_heard = time();
 			try { dns_answer(pkt); } catch (e) { warn(`autoaddd: dns_answer: ${e}\n`); }
 		}
 	}, uloop.ULOOP_READ);
@@ -1415,8 +1430,8 @@ function tick() {
 	ct_text = null;
 	daily_log_reset();
 	check_table();
-	dns_subscribe();
 	sniff_start();
+	dns_subscribe();
 	prune_names();
 	expire_tips();
 	try { load_own(); } catch (e) { warn(`autoaddd: load_own: ${e}\n`); }

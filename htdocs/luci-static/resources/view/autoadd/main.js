@@ -18,7 +18,7 @@ var callUpdate = rpc.declare({ object: 'autoadd', method: 'update', expect: { ''
 var callSetAutoupdate = rpc.declare({ object: 'autoadd', method: 'set_autoupdate', params: [ 'auto' ], expect: { '': {} } });
 
 // must match VERSION in /usr/sbin/autoaddd: a mismatch means the browser runs a cached copy of this file
-var VIEW_VERSION = '3.1.0';
+var VIEW_VERSION = '3.1.1';
 var RELOAD_KEY = 'autoadd.reload';
 
 // short label and colour of a candidate status; the full text goes below it
