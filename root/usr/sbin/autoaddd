@@ -11,7 +11,7 @@ let uci = require("uci");
 let socket = null;
 try { socket = require("socket"); } catch (e) {}
 
-const VERSION = "3.1.1";
+const VERSION = "3.1.2";
 // the daemon takes no arguments. A copy started by hand next to the service flushes the same
 // nft sets and wipes its probe directory, so anything like "autoaddd -v" only prints the version
 if (length(ARGV)) {
@@ -229,9 +229,9 @@ function resolve(d) {
 	let out = p.read("all") ?? "";
 	p.close();
 	for (let line in split(out, "\n")) {
-		let m = match(line, /Address(?: [0-9]+)?: +([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
-		if (m && is_public(m[1]))
-			push(res, m[1]);
+		let m = match(line, /Address( [0-9]+)?: +([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+		if (m && is_public(m[2]))
+			push(res, m[2]);
 	}
 	return res;
 }
