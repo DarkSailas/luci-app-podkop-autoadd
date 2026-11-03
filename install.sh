@@ -231,6 +231,10 @@ fi
 [ -n "$section" ] || die "No section found in /etc/config/podkop. Configure podkop first."
 
 uci set autoadd.main.section="$section"
+# up to 3.1 the default was socks5://127.0.0.1:4534, which only a hand-made sing-box inbound provided
+case "$(uci -q get autoadd.main.proxy)" in
+''|socks5://127.0.0.1:4534) uci set autoadd.main.proxy=auto ;;
+esac
 uci commit autoadd
 echo "podkop section: $section"
 

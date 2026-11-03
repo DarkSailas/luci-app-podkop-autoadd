@@ -9,7 +9,10 @@
 REPO_BASE="https://raw.githubusercontent.com/DarkSailas/luci-app-podkop-autoadd/main"
 RUN="/tmp/autoadd"
 LOG="$RUN/update.log"
-PROXY="$(uci -q get autoadd.main.proxy)"
+# the daemon writes the proxy it uses; with proxy 'auto' the setting holds no address
+PROXY="$(cat "$RUN/proxy" 2>/dev/null)"
+[ -n "$PROXY" ] || PROXY="$(uci -q get autoadd.main.proxy)"
+[ "$PROXY" != auto ] || PROXY=""
 
 # fetch URL FILE
 fetch() {

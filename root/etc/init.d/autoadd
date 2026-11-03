@@ -15,6 +15,13 @@ start_service() {
 
 stop_service() {
 	nft delete table inet autoadd 2>/dev/null
+	# own sing-box of the proxy check, started by autoaddd
+	pid="$(cat /var/run/autoadd-sing-box.pid 2>/dev/null)"
+	case "$pid" in
+	''|*[!0-9]*) ;;
+	*) grep -q autoadd "/proc/$pid/cmdline" 2>/dev/null && kill "$pid" ;;
+	esac
+	rm -f /var/run/autoadd-sing-box.pid
 }
 
 service_triggers() {

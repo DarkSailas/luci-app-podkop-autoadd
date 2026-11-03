@@ -11,7 +11,7 @@ let uci = require("uci");
 let socket = null;
 try { socket = require("socket"); } catch (e) {}
 
-const VERSION = "3.1.2";
+const VERSION = "3.2.0";
 // the daemon takes no arguments. A copy started by hand next to the service flushes the same
 // nft sets and wipes its probe directory, so anything like "autoaddd -v" only prints the version
 if (length(ARGV)) {
@@ -25,6 +25,13 @@ const RULESET_DIR = "/tmp/sing-box/rulesets";
 const RUN = "/tmp/autoadd";
 const PROBE = "/usr/libexec/autoadd-probe";
 const UPDATER = "/usr/libexec/autoadd-update";
+// proxy check without a proxy inbound in podkop: a sing-box of our own with the outbounds of podkop
+const HELPER_CFG = RUN + "/sing-box.json";
+const HELPER_PID = "/var/run/autoadd-sing-box.pid";
+const HELPER_PORT = 4534;
+const SING_BOX = "/usr/bin/sing-box";
+// the proxy address in use, read by autoadd-update
+const PROXY_FILE = RUN + "/proxy";
 
 const TICK_MS = 10000;
 const MAX_LOG = 200;
@@ -87,7 +94,7 @@ const LEASES = "/tmp/dhcp.leases";
 // addresses on trial, kept off the flash; read at start to take them back from podkop
 const TRIALS = RUN + "/trials.json";
 
-let cfg = { pcs: [], auto: true, autoupdate: false, proxy: "socks5://127.0.0.1:4534", section: "main" };
+let cfg = { pcs: [], auto: true, autoupdate: false, proxy: "auto", section: "main" };
 // added: by address; domains: by name; tips: addresses routed for TIP_SEC after a domain
 // is added, until DNS caches forget the real address
 let db = { added: {}, domains: {}, tips: {}, ignore: {} };
@@ -120,6 +127,9 @@ let dom_hold = 0;
 // own: addresses of the proxy servers podkop itself connects to
 let own = {};
 let own_next = 0;
+// px: how probes reach the proxy. url null: no way, probes are not run
+// src: "uci" (set by hand), "podkop" (a proxy inbound of podkop), "helper" (own sing-box)
+let px = { url: null, src: null, desc: null, err: null, sig: null, conf: null, proc: null, pid: 0, next: 0, down: 0 };
 let dns_sub = null;
 let dns_ok = false;
 // sniff: raw socket that hears the DNS answers podkop gives dnsmasq
@@ -279,8 +289,7 @@ function load_cfg() {
 	cfg.auto = c.get("autoadd", "main", "auto") != "0";
 	cfg.autoupdate = c.get("autoadd", "main", "autoupdate") == "1";
 	let proxy = c.get("autoadd", "main", "proxy");
-	if (type(proxy) == "string" && match(proxy, /^socks5h?:\/\/[0-9a-zA-Z.:]+$/))
-		cfg.proxy = proxy;
+	cfg.proxy = type(proxy) == "string" && match(proxy, /^socks5h?:\/\/[0-9a-zA-Z.:]+$/) ? proxy : "auto";
 	let section = c.get("autoadd", "main", "section");
 	if (type(section) == "string" && match(section, /^[0-9a-zA-Z_]+$/))
 		cfg.section = section;
@@ -625,6 +634,171 @@ function load_own() {
 	for (let ip in keys(own))
 		if (db.added[ip]?.how == "auto")
 			del_ip(ip, "это сервер прокси podkop: к нему соединение идёт напрямую");
+}
+
+function sb_path() {
+	let path = uci.cursor().get("podkop", "settings", "config_path");
+	return type(path) == "string" && path ? path : "/etc/sing-box/config.json";
+}
+
+// a mixed or socks inbound without users that podkop routes to the proxy of our section
+function podkop_inbound(j) {
+	let out = cfg.section + "-out";
+	for (let ib in (type(j.inbounds) == "array" ? j.inbounds : [])) {
+		if ((ib?.type != "mixed" && ib?.type != "socks") || !ib.tag || !(+ib.listen_port > 0) || length(ib.users ?? []))
+			continue;
+		let routed = false;
+		for (let r in (type(j.route?.rules) == "array" ? j.route.rules : [])) {
+			let ins = type(r?.inbound) == "array" ? r.inbound : [ r?.inbound ];
+			if (index(ins, ib.tag) >= 0) {
+				routed = r.outbound == out;
+				break;
+			}
+		}
+		if (!routed)
+			continue;
+		let host = ib.listen;
+		if (!host || host == "0.0.0.0" || host == "::")
+			host = "127.0.0.1";
+		if (!parse_ip(host))
+			continue;
+		return { url: `socks5://${host}:${ib.listen_port}`, desc: `inbound podkop ${ib.tag} (${host}:${ib.listen_port})` };
+	}
+	return null;
+}
+
+// config of our sing-box: the outbounds and DNS servers of podkop, one mixed inbound on
+// loopback, everything to <section>-out. FakeIP, rules and the cache file are left out
+function helper_conf(j) {
+	let out = cfg.section + "-out";
+	let obs = type(j.outbounds) == "array" ? j.outbounds : [];
+	if (!length(filter(obs, (o) => o?.tag == out)))
+		return null;
+	let servers = filter(type(j.dns?.servers) == "array" ? j.dns.servers : [], (d) => d?.tag && d.type != "fakeip");
+	let tags = map(servers, (d) => d.tag);
+	let dr = j.route?.default_domain_resolver;
+	if (type(dr) == "object")
+		dr = dr.server;
+	if (index(tags, dr) < 0)
+		dr = tags[0];
+	let c = {
+		log: { level: "error" },
+		inbounds: [ { type: "mixed", tag: "autoadd-in", listen: "127.0.0.1", listen_port: HELPER_PORT } ],
+		outbounds: obs,
+		route: { final: out, auto_detect_interface: true }
+	};
+	if (dr) {
+		c.dns = { servers, final: dr };
+		c.route.default_domain_resolver = dr;
+	}
+	if (type(j.endpoints) == "array" && length(j.endpoints))
+		c.endpoints = j.endpoints;
+	if (j.certificate)
+		c.certificate = j.certificate;
+	return sprintf("%.J\n", c);
+}
+
+function pid_alive(pid) {
+	let cmd = pid > 0 ? fs.readfile(`/proc/${pid}/cmdline`) : null;
+	return !!cmd && index(cmd, HELPER_CFG) >= 0;
+}
+
+function helper_stop() {
+	let pid = px.pid || +trim(fs.readfile(HELPER_PID) ?? "0");
+	if (pid_alive(pid))
+		system(`kill ${pid}`);
+	px.proc = null;
+	px.pid = 0;
+	px.conf = null;
+	fs.unlink(HELPER_PID);
+}
+
+function helper_start(conf) {
+	helper_stop();
+	if (!write_atomic(HELPER_CFG, conf))
+		return "не удалось записать " + HELPER_CFG;
+	if (system(`${SING_BOX} check -c ${HELPER_CFG} >/dev/null 2>&1`) != 0)
+		return "sing-box не принял конфиг, собранный из конфига podkop";
+	let proc;
+	proc = uloop.process(SING_BOX, [ "run", "-c", HELPER_CFG ], {}, function(code) {
+		if (px.proc != proc)
+			return;
+		px.proc = null;
+		px.pid = 0;
+		px.conf = null;
+		fs.unlink(HELPER_PID);
+		// started again by proxy_refresh after a pause
+		px.sig = null;
+		px.next = time() + 60;
+		log(`свой sing-box для проверки через прокси завершился (код ${code}), перезапуск через минуту`);
+	});
+	px.proc = proc;
+	px.pid = proc.pid();
+	px.conf = conf;
+	fs.writefile(HELPER_PID, px.pid + "\n");
+	return null;
+}
+
+function proxy_set(url, src, desc, err) {
+	if (px.url != url || px.err != err)
+		log(url ? `проверка через прокси: ${desc}` : `проверка через прокси невозможна: ${err}`);
+	px.url = url;
+	px.src = src;
+	px.desc = desc;
+	px.err = err;
+	px.down = 0;
+	write_atomic(PROXY_FILE, (url ?? "") + "\n");
+}
+
+// picks the way to the proxy again when the setting or the sing-box config of podkop changes
+function proxy_refresh() {
+	let now = time();
+	if (now < px.next)
+		return;
+	let path = sb_path();
+	let st = fs.stat(path);
+	let sig = `${cfg.proxy}|${cfg.section}|${st?.mtime}|${st?.size}`;
+	if (sig == px.sig && (px.src != "helper" || px.proc))
+		return;
+	px.sig = sig;
+	if (cfg.proxy != "auto") {
+		helper_stop();
+		proxy_set(cfg.proxy, "uci", cfg.proxy + " (задан в настройках)", null);
+		return;
+	}
+	let j = null;
+	try { j = json(fs.readfile(path)); } catch (e) {}
+	if (type(j) != "object") {
+		// podkop is stopped or writing the file: a running copy of ours keeps working
+		if (!px.proc)
+			proxy_set(null, null, null, `нет конфига sing-box ${path}`);
+		px.sig = null;
+		px.next = now + 30;
+		return;
+	}
+	let ib = podkop_inbound(j);
+	if (ib) {
+		helper_stop();
+		proxy_set(ib.url, "podkop", ib.desc, null);
+		return;
+	}
+	let conf = helper_conf(j);
+	if (!conf) {
+		helper_stop();
+		proxy_set(null, null, null, `в конфиге sing-box нет outbound ${cfg.section}-out`);
+		return;
+	}
+	if (px.proc && conf == px.conf)
+		return;
+	let err = helper_start(conf);
+	if (err) {
+		px.sig = null;
+		px.next = now + 300;
+		proxy_set(null, null, null, err);
+		return;
+	}
+	// a probe right after the start may find the port still closed: such results are not judged
+	proxy_set(`socks5://127.0.0.1:${HELPER_PORT}`, "helper", `свой sing-box через outbound ${cfg.section}-out (127.0.0.1:${HELPER_PORT})`, null);
 }
 
 function ct_read() {
@@ -1048,10 +1222,12 @@ function scan_use() {
 // targets: { "ip:port": site name or null }. With a name the probe downloads from the site
 // (SNI and Host are set), without it only the TLS handshake by bare address is checked
 function run_probe(targets, cb) {
+	if (!px.url)
+		return false;
 	probing = true;
 	let out = RUN + "/probe.out";
 	fs.unlink(out);
-	let args = [ out, cfg.proxy ];
+	let args = [ out, px.url ];
 	for (let k, n in targets)
 		push(args, n ? k + ":" + n : k);
 	uloop.process(PROBE, args, {}, function(code) {
@@ -1074,11 +1250,24 @@ function run_probe(targets, cb) {
 			r.direct_ok = r.named ? r.d_rc == 0 : r.direct_tls;
 			r.proxy_tls = r.p_rc == 0 && r.p_ac > 0;
 			r.proxy_answer = r.proxy_tls || r.p_rc == 35 || r.p_rc == 52 || r.p_rc == 56;
+			// 5/7: the proxy itself did not answer, the result says nothing about the address
+			r.no_proxy = r.p_rc == 5 || r.p_rc == 7;
 			res[k] = r;
 		}
 		fs.unlink(out);
+		let down = length(filter(values(res), (r) => r.no_proxy));
+		if (down && down == length(res)) {
+			if (++px.down == 3) {
+				log(`прокси для проверки не отвечает (${px.desc}): адреса не добавляются и не удаляются`);
+				// the inbound may have gone while the config file kept its time and size
+				px.sig = null;
+			}
+		}
+		else if (length(res))
+			px.down = 0;
 		cb(res);
 	});
+	return true;
 }
 
 function judge(c, r) {
@@ -1161,12 +1350,22 @@ function probe_cands() {
 	}
 	if (!n)
 		return false;
-	run_probe(t, function(res) {
-		for (let k in keys(t))
-			if (cands[k] && res[k])
-				judge(cands[k], res[k]);
+	return run_probe(t, function(res) {
+		let now = time();
+		for (let k in keys(t)) {
+			let c = cands[k], r = res[k];
+			if (!c || !r)
+				continue;
+			if (r.no_proxy && !r.direct_ok) {
+				c.status = "no_proxy";
+				c.res = r.named ? `напрямую rc=${r.d_rc}, ${kb(r.d_sz)}; прокси для проверки недоступен`
+					: `напрямую rc=${r.d_rc}; прокси для проверки недоступен`;
+				c.next = now + 120;
+				continue;
+			}
+			judge(c, r);
+		}
 	});
-	return true;
 }
 
 // automatic entries are probed every RECHECK_SEC; an entry that answers directly
@@ -1201,6 +1400,11 @@ function recheck_added() {
 			e.chk = now;
 			if (!r)
 				continue;
+			if (r.no_proxy && !r.direct_ok) {
+				// checked again soon, the counters stay as they are
+				e.chk = now - RECHECK_SEC + 600;
+				continue;
+			}
 			e.okd = r.direct_ok ? (e.okd ?? 0) + 1 : 0;
 			e.dead = (!r.direct_tls && !r.proxy_answer) ? (e.dead ?? 0) + 1 : 0;
 			let why = e.okd >= 2 ? "снова доступен напрямую" : e.dead >= 5 ? "не отвечает 5 проверок подряд" : null;
@@ -1435,6 +1639,7 @@ function tick() {
 	prune_names();
 	expire_tips();
 	try { load_own(); } catch (e) { warn(`autoaddd: load_own: ${e}\n`); }
+	try { proxy_refresh(); } catch (e) { warn(`autoaddd: proxy_refresh: ${e}\n`); }
 	poll_sets();
 	try { scan_frozen(); } catch (e) { warn(`autoaddd: scan_frozen: ${e}\n`); }
 	try { scan_udp_stall(); udp_trials(); scan_udp(); } catch (e) { warn(`autoaddd: udp: ${e}\n`); }
@@ -1469,6 +1674,7 @@ function status(all, all_added) {
 		update: { latest: upd.latest, available: !!upd.latest && ver_newer(upd.latest, VERSION), checked: upd.checked,
 			  state: upd.state, error: upd.error, auto: cfg.autoupdate },
 		auto: cfg.auto, pcs: cfg.pcs, probing,
+		proxy: { url: px.url, src: px.src, desc: px.desc, err: px.err, down: px.down >= 3 },
 		cands_total: length(cands), cands_shown, names_total: length(names),
 		added_total: length(al), added: all_added ? al : slice(al, 0, SHOW_ROWS), cands: cl,
 		ignore: sort(keys(db.ignore)), last, log: logbuf
@@ -1760,6 +1966,8 @@ function m_set_device(a) {
 
 fs.mkdir(RUN);
 load_cfg();
+// a sing-box of ours left by the previous run of the daemon
+helper_stop();
 load_db();
 if (!fs.stat(LIST))
 	save_list(false);

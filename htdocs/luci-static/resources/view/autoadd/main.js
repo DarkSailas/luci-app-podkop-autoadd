@@ -18,7 +18,7 @@ var callUpdate = rpc.declare({ object: 'autoadd', method: 'update', expect: { ''
 var callSetAutoupdate = rpc.declare({ object: 'autoadd', method: 'set_autoupdate', params: [ 'auto' ], expect: { '': {} } });
 
 // must match VERSION in /usr/sbin/autoaddd: a mismatch means the browser runs a cached copy of this file
-var VIEW_VERSION = '3.1.2';
+var VIEW_VERSION = '3.2.0';
 var RELOAD_KEY = 'autoadd.reload';
 
 // short label and colour of a candidate status; the full text goes below it
@@ -32,6 +32,7 @@ var STATUS_PILL = {
 	'suspect': [ 'спорный', 'warn' ],
 	'dead': [ 'не отвечает', '' ],
 	'direct_ok': [ 'доступен напрямую', 'ok' ],
+	'no_proxy': [ 'нечем проверить', 'bad' ],
 	'blocked': [ 'заблокирован', 'bad' ]
 };
 
@@ -45,6 +46,7 @@ var STATUS = {
 	'suspect': 'TCP напрямую открывается, проверка TLS с роутера не проходит — решите сами',
 	'dead': 'не отвечает ни напрямую, ни через прокси',
 	'direct_ok': 'напрямую доступен',
+	'no_proxy': 'прокси для проверки не отвечает, проверка повторится через 2 минуты',
 	'blocked': 'заблокирован, но автодобавление выключено или достигнут предел'
 };
 
@@ -638,6 +640,9 @@ return view.extend({
 						btn(st.auto ? 'Выключить' : 'Включить', st.auto ? 'cbi-button-neutral' : 'cbi-button-action', function() {
 							return act(callSetAuto(!st.auto)).then(function() { return self.refresh(); });
 						}),
+						(st.proxy && (!st.proxy.url || st.proxy.down))
+							? pill('проверка через прокси не работает', 'bad', st.proxy.url ? 'Не отвечает: ' + st.proxy.desc : (st.proxy.err || ''))
+							: '',
 						pcs.length ? '' : pill('ни одно устройство не отслеживается', 'warn', 'Отметьте устройства в разделе «Устройства»')
 					]),
 					E('div', { 'class': 'aa-figs' }, [
@@ -654,7 +659,8 @@ return view.extend({
 					E('div', {}, [
 						E('span', { 'class': 'aa-k' }, 'Служба'),
 						'работает с ', fmtShort(st.started),
-						E('span', { 'class': 'aa-sub' }, 'имён DNS в памяти: ' + (st.names_total || 0))
+						E('span', { 'class': 'aa-sub' }, 'имён DNS в памяти: ' + (st.names_total || 0)),
+						st.proxy && st.proxy.url ? E('span', { 'class': 'aa-sub', 'title': st.proxy.url }, 'проверка: ' + (st.proxy.src == 'helper' ? 'свой sing-box' : st.proxy.src == 'podkop' ? 'вход podkop' : 'прокси из настроек')) : ''
 					])
 				])
 			]),
